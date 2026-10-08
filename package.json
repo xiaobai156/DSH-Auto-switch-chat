@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-handoff",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "会话压缩计数：累计三次后，在一轮回复结束时总结并交接到新会话。",
   "type": "module",
@@ -11,7 +11,7 @@
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
-  "files": ["index.js", "core.js", "client.js", "cordis.patch.yml", "README.md"],
+  "files": ["index.js", "core.js", "client.js", "cordis.patch.yml", "README.md", "VALIDATION.md", "backend.test.mjs", "runtime.test.mjs", "runtime-fixture.mjs", "recovery-seed.mjs", "client.browser.test.mjs", "client.browser.fixture.mjs"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

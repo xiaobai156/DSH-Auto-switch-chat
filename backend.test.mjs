@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { HandoffCoordinator, Journal, initCount, foldCount, nextTitle, fitTitle, parseSummary, transientFailure, fitTranscript, summaryTranscript } from './core.js';
+import { HandoffCoordinator, Journal, initCount, foldCount, nextTitle, fitTitle, parseSummary, transientFailure, fitTranscript, summaryTranscript, processIdentity, forwardedInput } from './core.js';
 
 const end = (seq, kind = 'completed') => ({ seq, type: 'turn/end', data: { reason: { kind } } });
 const compact = (seq, id, error) => ({ seq, type: 'compaction/end', data: { compactionId: id, turn: 1, ...(error ? { error } : {}) } });
@@ -97,10 +97,14 @@ test('restart after queue-before-journal commit recovers without duplicate deliv
   let failFlush = true;
   const h = await harness(t, { flush: async () => { if (failFlush) throw new Error('disk temporarily unavailable'); } });
   h.eligible(); await h.coordinator.attempt('source');
-  assert.equal(h.deliveries.length, 1); assert.equal((await h.journal.read('source')).phase, 'prepared');
+  assert.equal(h.deliveries.length, 1); assert.equal((await h.journal.read('source')).resumePhase, 'committing');
   failFlush = false;
   const restarted = new HandoffCoordinator(h.host, h.journal);
   await restarted.recover();
+  assert.equal((await restarted.status('source')).phase, 'error');
+  await restarted.retry('source');
+  clearTimeout(restarted.state('source').timer); restarted.state('source').timer = undefined;
+  await restarted.attempt('source');
   assert.equal(h.deliveries.length, 1); assert.equal((await restarted.status('source')).phase, 'done');
   await restarted.dispose();
 });
@@ -216,7 +220,7 @@ async function lockJournal(t) {
 }
 
 test('transient summary failures back off three times, then stop; manual retry keeps stable delivery IDs', async (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
   let calls = 0;
   const h = await harness(t, { summarize: async () => {
     calls++;
@@ -405,4 +409,207 @@ test('a normally released lock is reacquired only by atomic publication, never s
   assert.equal(await journal.lock(id), undefined);
   assert.equal(staleRemovals, 0);
   assert.equal(await readFile(file, 'utf8'), competingOwner);
+});
+
+test('terminal failures and retry limits survive repeated coordinator restarts', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let calls = 0;
+  const h = await harness(t, { summarize: async () => {
+    calls++;
+    throw Object.assign(new Error('temporary transport failure'), { code: 'TRANSPORT' });
+  } });
+  h.eligible();
+  await h.coordinator.attempt('source');
+  let current = h.coordinator;
+  try {
+    for (const delay of [5000, 15000, 45000]) {
+      const before = calls;
+      await current.dispose();
+      current = new HandoffCoordinator(h.host, h.journal);
+      await current.recover();
+      assert.equal(calls, before, 'restart must preserve the retry deadline');
+      t.mock.timers.tick(delay);
+      await Promise.all([...current.runs]);
+      assert.equal(calls, before + 1);
+    }
+    assert.equal(calls, 4);
+    assert.equal((await h.journal.read('source')).retryAttempts, 3);
+    await current.dispose();
+    current = new HandoffCoordinator(h.host, h.journal);
+    await current.recover();
+    t.mock.timers.tick(1000000);
+    await Promise.all([...current.runs]);
+    assert.equal(calls, 4, 'exhausted retries must remain stopped after restart');
+    assert.equal((await current.status('source')).phase, 'error');
+    assert.equal((await current.status('source')).retryAt, undefined);
+    h.host.summarize = async () => ({ hasUnfinishedTask: false, summary: '手动重试后恢复成功。' });
+    await current.retry('source');
+    t.mock.timers.tick(120);
+    await Promise.all([...current.runs]);
+    assert.equal(h.deliveries.length, 1);
+  } finally { await current.dispose(); }
+});
+
+test('a per-session pause persists before threshold and resume enables the saved handoff', async t => {
+  const h = await harness(t, { count: async () => 0 });
+  assert.equal((await h.coordinator.pause('source', true)).phase, 'paused');
+  assert.equal((await h.coordinator.pause('source', false)).phase, 'watching');
+  assert.equal((await h.coordinator.pause('source', true)).phase, 'paused');
+  await h.coordinator.dispose();
+  const restarted = new HandoffCoordinator(h.host, h.journal);
+  try {
+    await restarted.recover();
+    assert.equal((await restarted.status('source')).phase, 'paused');
+    h.host.count = async () => 3;
+    restarted.state('source').eligible = 10;
+    await restarted.attempt('source');
+    assert.equal(h.deliveries.length, 0);
+    await restarted.pause('source', false);
+    clearTimeout(restarted.state('source').timer); restarted.state('source').timer = undefined;
+    await restarted.attempt('source');
+    assert.equal(h.deliveries.length, 1);
+  } finally { await restarted.dispose(); }
+});
+
+test('pausing an in-flight summary aborts it before any task is transferred', async t => {
+  const started = Promise.withResolvers();
+  const h = await harness(t, { summarize: async (_source, signal) => {
+    started.resolve();
+    await new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  h.eligible();
+  const running = h.coordinator.attempt('source');
+  await started.promise;
+  await h.coordinator.pause('source', true);
+  await running;
+  assert.equal((await h.coordinator.status('source')).phase, 'paused');
+  assert.equal((await h.journal.read('source')).paused, true);
+  assert.equal(h.deliveries.length, 0);
+});
+
+test('prepared recovery does not wait behind an unrelated stalled summary', async t => {
+  const h = await harness(t);
+  const sources = new Map(['source', 'slow'].map(id => [id, { id, status: 'idle', inbox: { hasPending: false } }]));
+  h.host.agent = id => sources.get(id) ?? h.targets.get(id);
+  h.host.restore = async id => sources.get(id) ?? h.targets.get(id);
+  const started = Promise.withResolvers(), gate = Promise.withResolvers();
+  h.host.summarize = async () => { started.resolve(); await gate.promise; return { hasUnfinishedTask: true, summary: '慢速摘要已经完成。' }; };
+  await h.journal.write('source', { phase: 'prepared', sourceSeq: 10, nextSessionId: 'ready-target',
+    messageId: 'ready-message', nextTitle: '已准备（续1）', hasUnfinishedTask: false, summary: '已经准备好的完整摘要。' });
+  await h.journal.write('slow', { phase: 'summarizing', sourceSeq: 10, nextSessionId: 'slow-target', messageId: 'slow-message' });
+  const recovery = h.coordinator.recover();
+  try {
+    await started.promise;
+    for (let i = 0; i < 100 && !h.deliveries.some(item => item.id === 'ready-target'); i++) await new Promise(resolve => setTimeout(resolve, 2));
+    assert.ok(h.deliveries.some(item => item.id === 'ready-target'));
+    assert.ok(!h.deliveries.some(item => item.id === 'slow-target'));
+  } finally { gate.resolve(); await recovery; }
+  assert.equal(h.deliveries.length, 2);
+});
+
+test('input replay includes native claims but excludes explicit queue cancellations', () => {
+  const msg = id => ({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: id }] });
+  const events = [
+    { seq: 11, type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, inserted: [msg('claimed'), msg('canceled')], removedCount: 0 } },
+    { seq: 12, type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, inserted: [], removedCount: 1 } },
+    { seq: 13, type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, inserted: [], removedCount: 1, outcome: 'canceled' } },
+    { seq: 14, type: 'user/message', data: msg('direct') },
+  ];
+  assert.deepEqual(forwardedInput({ events }, { sourceSeq: 10 }).map(message => message.id), ['claimed', 'direct']);
+});
+
+test('PID reuse is detected from OS process identity, while the real live holder stays protected', async t => {
+  const journal = await lockJournal(t);
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true, stdio: 'ignore' });
+  const exited = new Promise(resolve => child.once('exit', resolve));
+  try {
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    const identity = await processIdentity(child.pid);
+    assert.ok(identity?.key);
+    const old = new Date(identity.startedAt - 600000);
+    for (const [id, holder, expected] of [
+      ['legacy-reused', { pid: child.pid }, true],
+      ['reused', { pid: child.pid, processKey: 'previous-process-instance' }, true],
+      ['live-owner', { pid: child.pid, processKey: identity.key }, false],
+    ]) {
+      const path = journal.path(id, '.lock');
+      await writeFile(path, JSON.stringify(holder));
+      await utimes(path, old, old);
+      const unlock = await journal.lock(id);
+      assert.equal(Boolean(unlock), expected, id);
+      await unlock?.();
+    }
+  } finally { child.kill(); await exited; }
+});
+
+for (const failureAt of ['source-flush', 'forward']) {
+  test(`cold completed ownership retries a ${failureAt} failure with no eligible source turn`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const events = [end(10)], forwarded = [];
+    const h = await harness(t, { history: async () => ({ events, inheritedEventCount: 0 }) });
+    h.eligible(); await h.coordinator.attempt('source'); await h.coordinator.dispose();
+    const restarted = new HandoffCoordinator(h.host, h.journal);
+    const originalHasMessage = h.host.hasMessage;
+    let failing = true;
+    h.host.hasMessage = async (id, messageId) => forwarded.includes(messageId) || originalHasMessage(id, messageId);
+    h.host.recordInput = async (_source, messages) => {
+      for (const message of messages) events.push({ seq: events.at(-1).seq + 1, type: 'user/message', data: message });
+    };
+    h.host.forward = (_target, message) => {
+      if (failing && failureAt === 'forward') throw Object.assign(new Error('temporary forward failure'), { code: 'TRANSPORT' });
+      forwarded.push(message.id);
+    };
+    h.host.flush = async id => {
+      if (failing && failureAt === 'source-flush' && id === 'source') throw Object.assign(new Error('temporary source flush failure'), { code: 'TRANSPORT' });
+    };
+    try {
+      await restarted.recover();
+      assert.equal(restarted.state('source').eligible, null);
+      await assert.rejects(restarted.forward('source', [{ id: 'late-message', source: { kind: 'user' }, content: [] }], new AbortController().signal), { code: 'TRANSPORT' });
+      assert.equal((await h.journal.read('source')).phase, 'error');
+      assert.equal((await restarted.status('source')).canPause, false, 'committed ownership must not advertise a no-op pause');
+      assert.ok(restarted.state('source').timer);
+      failing = false;
+      t.mock.timers.tick(5000); await Promise.all([...restarted.runs]);
+      assert.equal((await restarted.status('source')).phase, 'done');
+      assert.deepEqual(forwarded, ['late-message']);
+      assert.equal(h.deliveries.length, 1);
+    } finally { await restarted.dispose(); }
+  });
+}
+
+test('resuming a paused transient error restores its original retry deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const h = await harness(t, { summarize: async () => { throw Object.assign(new Error('temporary failure'), { code: 'TRANSPORT' }); } });
+  h.eligible(); await h.coordinator.attempt('source');
+  const deadline = (await h.journal.read('source')).retryAt;
+  await h.coordinator.pause('source', true);
+  t.mock.timers.tick(2000);
+  await h.coordinator.pause('source', false);
+  assert.equal((await h.coordinator.status('source')).retryAt, deadline);
+  assert.ok(h.coordinator.state('source').timer);
+  h.host.summarize = async () => ({ hasUnfinishedTask: false, summary: '暂停后按原定时间成功重试。' });
+  t.mock.timers.tick(2999); await Promise.all([...h.coordinator.runs]);
+  assert.equal(h.deliveries.length, 0);
+  t.mock.timers.tick(1); await Promise.all([...h.coordinator.runs]);
+  assert.equal(h.deliveries.length, 1);
+});
+
+test('Windows journal replacement retries sharing violations and leaves the last durable value on exhaustion', { skip: process.platform !== 'win32' }, async t => {
+  const journal = await lockJournal(t);
+  await journal.write('replace', { phase: 'watching', marker: 'original' });
+  const originalRename = fsPromises.rename;
+  let failures = 2;
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  t.mock.method(fsPromises, 'rename', async (...args) => {
+    if (failures-- > 0) throw Object.assign(new Error('isolated sharing violation'), { code: 'EPERM' });
+    return originalRename(...args);
+  });
+  syncBuiltinESMExports();
+  await journal.write('replace', { phase: 'watching', marker: 'replacement' });
+  assert.equal((await journal.read('replace')).marker, 'replacement');
+  failures = 10;
+  await assert.rejects(journal.write('replace', { phase: 'watching', marker: 'uncommitted' }), { code: 'EPERM' });
+  assert.equal((await journal.read('replace')).marker, 'replacement');
+  assert.equal((await readdir(journal.directory)).filter(name => name.endsWith('.tmp')).length, 0);
 });

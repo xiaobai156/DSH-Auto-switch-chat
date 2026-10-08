@@ -94,4 +94,4 @@ async function fixture({ files: existingFiles, persistence = false, maxTitleByte
 }
 
 
-export { fixture, makeHost, compactionProjection, createUserMessage, route };
+export { fixture, makeHost, compactionProjection, createUserMessage, route, core as native };

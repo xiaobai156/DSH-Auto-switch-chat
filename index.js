@@ -1,9 +1,10 @@
 import { join } from 'node:path';
 import { z } from 'zod';
-import { BlockAssembler, LlmError, offloadedImageText, resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler, LlmError, createSystemMessage, offloadedImageText, resolveImageAttachmentAccess } from '@deepseek-ai/dsh-llm';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy';
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
+import { carrierKeyOf } from '@deepseek-ai/dsh-scope';
 import { HandoffCoordinator, Journal, PROJECTION_KEY, initCount, foldCount, parseSummary, fitTitle, summaryTranscript } from './core.js';
 
 export const name = 'dsh-session-handoff';
@@ -39,8 +40,8 @@ export function textOf(event) {
 export function collectAttachments(events) {
   const attachments = new Map();
   for (const event of events) {
-    if (event.type !== 'user/message') continue;
-    for (const block of event.data?.content ?? []) {
+    if (!['user/message', 'tool/result'].includes(event.type)) continue;
+    for (const block of (event.data?.message ?? event.data)?.content ?? []) {
       if (!['file', 'image'].includes(block.type) || !block.attachment?.attachmentId) continue;
       // Reuse immutable native objects. Historical images stay available to tools
       // without uploading every old image to the next model request again.
@@ -61,17 +62,85 @@ function selectedModel(ctx, agent) {
 }
 
 export function makeHost(ctx) {
+  let coordinator;
+  const subagentRuns = new Map();
+  for (const edge of ['start', 'end']) ctx.on(`subagent/${edge}`, function(info) {
+    const parent = carrierKeyOf(this);
+    if (edge === 'start' && parent?.id) subagentRuns.set(info.runId, parent.id);
+    const parentId = subagentRuns.get(info.runId) ?? parent?.id;
+    if (edge === 'end') subagentRuns.delete(info.runId);
+    if (parentId) coordinator?.onRelatedActivity(parentId);
+  });
   // Native list metadata becomes nonblank only after a genuine turn starts.
   // Settle record-only handoffs through that driver without making an LLM call.
   // A durable source kind also handles a queued note after process restart.
-  ctx.on('agent/pre-step', ({ agent, messages, signal }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, messages, signal, turn, step }, next) => {
+    if (coordinator && messages.length && !agent.session.requestHeader() && agent.session.surface.nodes.length) {
+      const first = (await ctx.sessionQuery.readSurface(agent.id)).events[0];
+      if (first?.type === 'user/message' && first.data.source.kind === 'plugin:dsh-session-handoff:record-only' &&
+          await coordinator.migrateLegacy(agent, first.data, messages, signal)) return { kind: 'enter', messages: [] };
+    }
+    if (coordinator && await coordinator.forward(agent.id, messages, signal)) return { kind: 'enter', messages: [] };
     if (!messages.length || !messages.every((message) => message.source.kind === 'plugin:dsh-session-handoff:record-only')) return next();
     signal.throwIfAborted();
+    if (!agent.session.surface.nodes.length) {
+      // A local note is a step with no provider request. Initialize DSH's
+      // protected system head before its first user node, so a later real
+      // request remains valid when the JSONL log is read after restart.
+      agent.session.append('step/start', { turn, step });
+      agent.session.append('system/message', { turn, step, message: createSystemMessage('') }, { surfaceOp: 'append' });
+      agent.session.append('step/end', { turn, step });
+    }
     for (const message of messages) agent.session.append('user/message', message, { surfaceOp: 'append' });
     return Promise.resolve({ kind: 'enter', messages: [] });
   }, { prepend: true });
   return {
+    bind: value => { coordinator = value; },
     agent: (id) => ctx.agents.get(id),
+    rootId(id) {
+      const seen = new Set();
+      while (!seen.has(id)) {
+        seen.add(id);
+        const header = ctx.agents.get(id)?.session.header;
+        if (header?.origin !== 'subagent' || !header.parentSession) break;
+        id = header.parentSession;
+      }
+      return id;
+    },
+    guard(source) {
+      const goal = (source.ctx.get('goals') ?? ctx.get('goals'))?.get(source);
+      // Keep native Goal execution, activation, and round accounting in its
+      // owner. Never turn a paused/blocked/disarmed Goal into ordinary work.
+      if (goal && goal.phase !== 'complete') return 'goal';
+      const descendants = new Set([source.id]);
+      const agents = ctx.agents.list();
+      let changed;
+      do {
+        changed = false;
+        for (const agent of agents) {
+          const header = agent.session.header;
+          if (header.origin !== 'subagent' || !descendants.has(header.parentSession) || descendants.has(agent.id)) continue;
+          descendants.add(agent.id);
+          changed = true;
+        }
+      } while (changed);
+      for (const agent of agents) {
+        if (agent.id === source.id || !descendants.has(agent.id)) continue;
+        // An idle child may still be flushing and publishing its final result.
+        // Wait for native residency release, including nested child ownership.
+        return 'subagents';
+      }
+      if ([...subagentRuns.values()].some(id => descendants.has(id))) return 'subagents';
+    },
+    async recordInput(source, messages) {
+      const history = await ctx.sessionQuery.readSession(source.id);
+      const recorded = new Set(history.events.filter(event => event.type === 'user/message').map(event => event.data.id));
+      for (const message of messages) {
+        if (!recorded.has(message.id)) source.session.append('user/message', message, { surfaceOp: 'append' });
+      }
+    },
+    forward: (target, message) => target.followup(message),
+    cancel: target => target.cancel({ kind: 'user' }, { keepInbox: true }),
     history: (id) => ctx.sessionQuery.readSession(id),
     async restore(id) {
       const result = await ctx.sessionController.agents.resolveAgent(id);
@@ -202,28 +271,22 @@ export function apply(ctx) {
   ctx.on('agent/status', ({ agent, status }) => { if (status === 'idle') coordinator.onIdle(agent.id); });
   ctx.effect(() => () => coordinator.dispose());
   coordinator.recover().catch((error) => ctx.logger.warn(`session-handoff startup recovery: ${error.message}`));
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact', path: '/api/session-handoff/status',
-    async handler(req, res) {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-store');
-      if (req.method !== 'GET') { res.statusCode = 405; res.end(JSON.stringify({ error: 'GET required' })); return; }
-      const sessionId = new URL(req.url, 'http://localhost').searchParams.get('sessionId');
-      if (!sessionId || sessionId.length > 256) { res.statusCode = 400; res.end(JSON.stringify({ error: 'Invalid sessionId' })); return; }
-      try { res.end(JSON.stringify(await coordinator.status(sessionId))); }
-      catch (error) { res.statusCode = 500; res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); }
-    },
-  }));
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact', path: '/api/session-handoff/retry',
-    async handler(req, res) {
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-store');
-      if (req.method !== 'POST') { res.statusCode = 405; res.end(JSON.stringify({ error: 'POST required' })); return; }
-      const sessionId = new URL(req.url, 'http://localhost').searchParams.get('sessionId');
-      if (!sessionId || sessionId.length > 256) { res.statusCode = 400; res.end(JSON.stringify({ error: 'Invalid sessionId' })); return; }
-      try { res.end(JSON.stringify(await coordinator.retry(sessionId))); }
-      catch (error) { res.statusCode = 500; res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); }
-    },
-  }));
+  for (const [action, method] of [['status', 'GET'], ['retry', 'POST'], ['pause', 'POST'], ['resume', 'POST']]) {
+    ctx.effect(() => ctx.webServer.register({
+      kind: 'exact', path: `/api/session-handoff/${action}`,
+      async handler(req, res) {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        if (req.method !== method) { res.statusCode = 405; res.end(JSON.stringify({ error: `${method} required` })); return; }
+        const sessionId = new URL(req.url, 'http://localhost').searchParams.get('sessionId');
+        if (!sessionId || sessionId.length > 256) { res.statusCode = 400; res.end(JSON.stringify({ error: 'Invalid sessionId' })); return; }
+        try {
+          const value = action === 'status' ? await coordinator.status(sessionId)
+            : action === 'retry' ? await coordinator.retry(sessionId)
+            : await coordinator.pause(sessionId, action === 'pause');
+          res.end(JSON.stringify(value));
+        } catch (error) { res.statusCode = 500; res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); }
+      },
+    }));
+  }
 }

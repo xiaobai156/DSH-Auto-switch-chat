@@ -22,6 +22,15 @@ window.__ModuleLoader__.load({
             invalidResponse: '压缩次数响应无效。',
             retry: '重试交接',
             retrying: '正在重试…',
+            committing: '正在保存交接',
+            deferred: '暂缓交接',
+            goal: 'Goal 尚未结束，保留原会话及停止条件。',
+            subagents: '等待子代理完成并处理结果。',
+            paused: '已暂停交接',
+            pause: '暂停交接',
+            resume: '恢复交接',
+            open: '打开续接会话',
+            countdown: '{seconds} 秒后重试',
           },
           en: {
             count: 'Compacted {count} times',
@@ -36,6 +45,15 @@ window.__ModuleLoader__.load({
             invalidResponse: 'Invalid compaction count response.',
             retry: 'Retry handoff',
             retrying: 'Retrying…',
+            committing: 'Saving handoff',
+            deferred: 'Handoff deferred',
+            goal: 'Keep the unfinished Goal and its stop conditions in this session.',
+            subagents: 'Waiting for subagents and their results.',
+            paused: 'Handoff paused',
+            pause: 'Pause handoff',
+            resume: 'Resume handoff',
+            open: 'Open continuation',
+            countdown: 'Retry in {seconds}s',
           },
         }));
 
@@ -55,6 +73,7 @@ window.__ModuleLoader__.load({
           const liveCount = useProjection('sessionHandoffCompactions', (state) => state?.count);
           const [view, setView] = React.useState(null);
           const [retrying, setRetrying] = React.useState(false);
+          const [now, setNow] = React.useState(Date.now);
           const refreshRef = React.useRef();
           const retryRef = React.useRef();
 
@@ -66,12 +85,15 @@ window.__ModuleLoader__.load({
             let serial = 0;
             let lastPhase;
             let lastCount = 0;
+            let retryAt;
+            let navigationPending = false;
             const mountedAt = Date.now();
             setView(null);
             setRetrying(false);
             if (!sessionId) return;
 
             function maybeNavigate(data) {
+              navigationPending = false;
               if (data.phase !== 'done' || typeof data.nextSessionId !== 'string' ||
                   !data.nextSessionId || data.nextSessionId === sessionId) return;
               const key = marker(sessionId, data.nextSessionId);
@@ -86,6 +108,9 @@ window.__ModuleLoader__.load({
               const current = Object.values(ctx.sessions.list.getSnapshot().byId)
                 .find((row) => (row.retainedBy?.mainView ?? 0) > 0);
               if (current?.id !== sessionId) return;
+              // Forwarding settles the old driver's empty turn first. Keep its
+              // input visible until routing has finished, then open the target.
+              if (current.status === 'running') { navigationPending = true; return; }
               markHandled(key);
               try {
                 ctx.uiWorkspace.openSession(data.nextSessionId);
@@ -96,7 +121,8 @@ window.__ModuleLoader__.load({
               }
             }
 
-            async function refresh(manual = false) {
+            async function refresh(action = 'status') {
+              const manual = action !== 'status';
               if (disposed || (!manual && document.hidden)) return;
               clearTimeout(timer);
               request?.abort();
@@ -106,7 +132,7 @@ window.__ModuleLoader__.load({
               let unavailable = false;
               if (manual) setRetrying(true);
               try {
-                const response = await fetch(`/api/session-handoff/${manual ? 'retry' : 'status'}?sessionId=${encodeURIComponent(sessionId)}`, {
+                const response = await fetch(`/api/session-handoff/${action}?sessionId=${encodeURIComponent(sessionId)}`, {
                   method: manual ? 'POST' : 'GET',
                   signal: controller.signal,
                   credentials: 'same-origin',
@@ -116,7 +142,7 @@ window.__ModuleLoader__.load({
                 const data = await response.json();
                 if (disposed || generation !== serial) return;
                 if (data.sessionId !== sessionId || !Number.isSafeInteger(data.count) || data.count < 0 ||
-                    !['watching', 'pending', 'summarizing', 'done', 'error'].includes(data.phase)) {
+                    !['watching', 'pending', 'summarizing', 'committing', 'done', 'error', 'deferred', 'paused'].includes(data.phase)) {
                   throw new Error(t('invalidResponse'));
                 }
                 const next = {
@@ -124,11 +150,17 @@ window.__ModuleLoader__.load({
                   count: data.count,
                   status: { watching: 'idle', done: 'handed-off' }[data.phase] || data.phase,
                   error: typeof data.error === 'string' ? data.error : '',
+                  retryAt: typeof data.retryAt === 'number' ? data.retryAt : undefined,
+                  nextSessionId: typeof data.nextSessionId === 'string' ? data.nextSessionId : undefined,
+                  reason: typeof data.reason === 'string' ? data.reason : '',
+                  canPause: data.canPause !== false,
                 };
                 lastPhase = data.phase;
                 lastCount = data.count;
+                retryAt = next.retryAt;
                 setView((old) => old?.sessionId === sessionId && old.count === next.count &&
-                  old.status === next.status && old.error === next.error && !old.unavailable ? old : next);
+                  old.status === next.status && old.error === next.error && old.retryAt === next.retryAt &&
+                  old.nextSessionId === next.nextSessionId && old.reason === next.reason && old.canPause === next.canPause && !old.unavailable ? old : next);
                 maybeNavigate(data);
                 firstResult = false;
               } catch (error) {
@@ -143,8 +175,9 @@ window.__ModuleLoader__.load({
                 clearTimeout(timeout);
                 if (!disposed && generation === serial) {
                   setRetrying(false);
-                  if (!document.hidden && (unavailable || lastPhase !== 'done')) {
-                    const fast = !unavailable && (lastCount >= 3 || ['pending', 'summarizing'].includes(lastPhase));
+                  if (!document.hidden && (unavailable || lastPhase !== 'done' || navigationPending)) {
+                    const fast = !unavailable && (navigationPending || ['pending', 'summarizing', 'committing'].includes(lastPhase) ||
+                      lastPhase === 'error' && retryAt || lastPhase === 'watching' && lastCount >= 3);
                     timer = setTimeout(() => refresh(), fast ? 2000 : 10000);
                   }
                 }
@@ -153,10 +186,10 @@ window.__ModuleLoader__.load({
 
             const visibility = () => {
               clearTimeout(timer);
-              if (!document.hidden && lastPhase !== 'done') refresh();
+              if (!document.hidden && (lastPhase !== 'done' || navigationPending)) refresh();
             };
             refreshRef.current = () => { if (lastPhase !== 'done') refresh(); };
-            retryRef.current = () => refresh(true);
+            retryRef.current = action => refresh(action);
             document.addEventListener('visibilitychange', visibility);
             refresh();
             return () => {
@@ -169,13 +202,30 @@ window.__ModuleLoader__.load({
             };
           }, [sessionId, t]);
           React.useEffect(() => { if (liveCount >= 3) refreshRef.current?.(); }, [liveCount]);
+          React.useEffect(() => {
+            if (!view?.retryAt) return;
+            let timer;
+            const tick = () => {
+              setNow(Date.now());
+              if (!document.hidden) timer = setTimeout(tick, 1000);
+            };
+            const visibility = () => { clearTimeout(timer); if (!document.hidden) tick(); };
+            visibility();
+            document.addEventListener('visibilitychange', visibility);
+            return () => { clearTimeout(timer); document.removeEventListener('visibilitychange', visibility); };
+          }, [sessionId, view?.retryAt]);
 
           const current = view?.sessionId === sessionId ? view : null;
           const status = current?.unavailable ? 'unavailable' : current?.status;
           const count = Number.isSafeInteger(liveCount) && liveCount >= 0
             ? Math.max(liveCount, current?.count ?? 0) : current?.count;
           const label = count != null ? t('count', { count }) : t('loading');
-          const suffix = status && status !== 'idle' ? ` · ${t(status)}` : '';
+          const suffix = (status && status !== 'idle' ? ` · ${t(status)}` : '') +
+            (current?.retryAt && !current.unavailable ? ` · ${t('countdown', { seconds: Math.max(0, Math.ceil((current.retryAt - now) / 1000)) })}` : '');
+          const button = (label, action) => h('button', {
+            type: 'button', disabled: retrying, onClick: action,
+            style: { marginLeft: 6, cursor: retrying ? 'wait' : 'pointer', color: 'inherit', font: 'inherit' },
+          }, t(label));
           return h('span', {
             className: 'dsh-session-handoff-status',
             'data-session-id': sessionId,
@@ -183,7 +233,7 @@ window.__ModuleLoader__.load({
             role: 'status',
             'aria-live': 'polite',
             'aria-atomic': true,
-            title: `${t('hint')}${current?.error ? `\n${current.error}` : ''}`,
+            title: `${t('hint')}${current?.reason ? `\n${t(current.reason)}` : ''}${current?.error ? `\n${current.error}` : ''}`,
             style: {
               order: 10,
               display: 'inline-flex',
@@ -195,10 +245,12 @@ window.__ModuleLoader__.load({
               whiteSpace: 'nowrap',
               cursor: 'default',
             },
-          }, label + suffix, status === 'error' ? h('button', {
-            type: 'button', disabled: retrying, onClick: () => retryRef.current?.(),
-            style: { marginLeft: 6, cursor: retrying ? 'wait' : 'pointer', color: 'inherit', font: 'inherit' },
-          }, t(retrying ? 'retrying' : 'retry')) : null);
+          }, label + suffix,
+          status === 'error' ? button(retrying ? 'retrying' : 'retry', () => retryRef.current?.('retry')) : null,
+          current?.canPause && !current.unavailable && !['handed-off', 'committing'].includes(status)
+            ? button(status === 'paused' ? 'resume' : 'pause', () => retryRef.current?.(status === 'paused' ? 'resume' : 'pause')) : null,
+          status === 'handed-off' && current.nextSessionId && current.nextSessionId !== sessionId
+            ? button('open', () => ctx.uiWorkspace.openSession(current.nextSessionId)) : null);
         }
 
         ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
