@@ -1,0 +1,3 @@
+- insert:
+    - id: local-session-handoff
+      name: '@local/dsh-session-handoff'
